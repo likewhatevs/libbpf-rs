@@ -1167,6 +1167,93 @@ fn test_skeleton_builder_deterministic() {
     assert_eq!(skel1, skel2);
 }
 
+/// Check that `reference_obj(true)` generates a skeleton using `include_bytes!`
+/// instead of inline byte arrays.
+#[test]
+fn test_skeleton_builder_reference_obj() {
+    let (_dir, proj_dir, _cargo_toml) = setup_temp_project();
+
+    create_dir(proj_dir.join("src/bpf")).expect("failed to create prog dir");
+    write(
+        proj_dir.join("src/bpf/prog.bpf.c"),
+        r#"
+            #include "vmlinux.h"
+            #include <bpf/bpf_helpers.h>
+
+            struct {
+                __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);
+            } sock_map SEC(".maps");
+
+            SEC("sk_reuseport")
+            long prog_select_sk(struct sk_reuseport_md *reuse_md)
+            {
+                unsigned int index = 0;
+                bpf_sk_select_reuseport(reuse_md, &sock_map, &index, 0);
+                return SK_PASS;
+            }
+        "#,
+    )
+    .expect("failed to write prog.bpf.c");
+
+    add_vmlinux_header(&proj_dir);
+
+    let obj = proj_dir.join("src/bpf/prog.o");
+    let skel = proj_dir.join("src/bpf/skel.rs");
+    SkeletonBuilder::new()
+        .source(proj_dir.join("src/bpf/prog.bpf.c"))
+        .obj(&obj)
+        .reference_obj(true)
+        .build_and_generate(&skel)
+        .unwrap();
+    let skel = read_to_string(skel).unwrap();
+
+    assert!(skel.contains("include_bytes!"));
+    // 127, 69, 76, 70 is the ELF magic number (\x7fELF); its absence
+    // confirms the object bytes are referenced, not inlined.
+    assert!(!skel.contains("127, 69, 76, 70"));
+}
+
+/// Check that the default skeleton inlines bytes rather than using `include_bytes!`.
+#[test]
+#[ignore = "may fail on some systems; depends on kernel headers that have been seen to be broken"]
+fn test_skeleton_builder_default_inlines_bytes() {
+    let (_dir, proj_dir, _cargo_toml) = setup_temp_project();
+
+    create_dir(proj_dir.join("src/bpf")).expect("failed to create prog dir");
+    write(
+        proj_dir.join("src/bpf/prog.bpf.c"),
+        r#"
+            #include "vmlinux.h"
+            #include <bpf/bpf_helpers.h>
+
+            struct {
+                __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);
+            } sock_map SEC(".maps");
+
+            SEC("sk_reuseport")
+            long prog_select_sk(struct sk_reuseport_md *reuse_md)
+            {
+                unsigned int index = 0;
+                bpf_sk_select_reuseport(reuse_md, &sock_map, &index, 0);
+                return SK_PASS;
+            }
+        "#,
+    )
+    .expect("failed to write prog.bpf.c");
+
+    add_vmlinux_header(&proj_dir);
+
+    let skel = proj_dir.join("src/bpf/skel.rs");
+    SkeletonBuilder::new()
+        .source(proj_dir.join("src/bpf/prog.bpf.c"))
+        .build_and_generate(&skel)
+        .unwrap();
+    let skel = read_to_string(skel).unwrap();
+
+    assert!(!skel.contains("include_bytes!"));
+    assert!(skel.contains("127, 69, 76, 70"));
+}
+
 /// Check that we generate a valid skeleton in the presence of duplicate
 /// structs in the BTF.
 #[test]

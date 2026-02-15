@@ -831,7 +831,7 @@ fn gen_skel_struct_ops_init(object: &Object) -> Result<String> {
 }
 
 /// Generate contents of a single skeleton
-fn gen_skel_contents(raw_obj_name: &str, obj_file_path: &Path) -> Result<String> {
+fn gen_skel_contents(raw_obj_name: &str, obj_file_path: &Path, obj_ref: bool) -> Result<String> {
     let mut skel = String::new();
 
     write!(
@@ -1163,11 +1163,22 @@ pub struct StructOps {{}}
     gen_skel_struct_ops_getters(&mut skel, &object)?;
     writeln!(skel, "}}")?;
 
-    // Coerce to &[u8] just to be safe, as we'll be using debug formatting
-    let bytes: &[u8] = &mmap;
-
     writeln!(skel, "#[unsafe(link_section = \".bpf.objs\")]")?;
-    writeln!(skel, "static DATA: [u8; {}] = {bytes:?};", bytes.len())?;
+    if obj_ref {
+        let obj_file_path = obj_file_path
+            .canonicalize()
+            .unwrap_or_else(|_| obj_file_path.to_path_buf());
+        writeln!(
+            skel,
+            "static DATA: [u8; {}] = *include_bytes!(\"{path}\");",
+            mmap.len(),
+            path = obj_file_path.display(),
+        )?;
+    } else {
+        // Coerce to &[u8] just to be safe, as we'll be using debug formatting
+        let bytes: &[u8] = &mmap;
+        writeln!(skel, "static DATA: [u8; {}] = {bytes:?};", bytes.len())?;
+    }
     writeln!(skel, "}}")?;
 
     Ok(skel)
@@ -1179,10 +1190,11 @@ fn gen_skel(
     obj: &Path,
     out: OutputDest<'_>,
     rustfmt_path: Option<&Path>,
+    obj_ref: bool,
 ) -> Result<()> {
     ensure!(!name.is_empty(), "Object file has no name");
 
-    let skel = gen_skel_contents(name, obj)?;
+    let skel = gen_skel_contents(name, obj, obj_ref)?;
     let skel = try_rustfmt(&skel, rustfmt_path)?;
 
     match out {
@@ -1249,6 +1261,7 @@ pub(crate) fn gen_single(
     obj_file: &Path,
     output: OutputDest<'_>,
     rustfmt_path: Option<&Path>,
+    obj_ref: bool,
 ) -> Result<()> {
     let filename = match obj_file.file_name() {
         Some(n) => n,
@@ -1273,7 +1286,7 @@ pub(crate) fn gen_single(
         ),
     };
 
-    let () = gen_skel(name, obj_file, output, rustfmt_path).with_context(|| {
+    let () = gen_skel(name, obj_file, output, rustfmt_path, obj_ref).with_context(|| {
         format!(
             "Failed to generate skeleton for {}",
             obj_file.to_string_lossy(),
@@ -1309,6 +1322,7 @@ fn gen_project(manifest_path: Option<&Path>, rustfmt_path: Option<&Path>) -> Res
             obj_file_path.as_path(),
             OutputDest::Directory(skel_path.as_path()),
             rustfmt_path,
+            false,
         )
         .with_context(|| {
             format!(
@@ -1344,7 +1358,7 @@ pub fn generate(
     }
 
     if let Some(obj_file) = object {
-        gen_single(obj_file, OutputDest::Stdout, rustfmt_path)
+        gen_single(obj_file, OutputDest::Stdout, rustfmt_path, false)
     } else {
         gen_project(manifest_path, rustfmt_path)
     }

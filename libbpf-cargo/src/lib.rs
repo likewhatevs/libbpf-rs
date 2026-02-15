@@ -55,6 +55,7 @@
 //! build`. This is a convenience command so you don't forget any steps. Alternatively, you could
 //! write a Makefile for your project.
 
+use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Path;
@@ -102,6 +103,7 @@ pub struct SkeletonBuilder {
     clang_args: Vec<OsString>,
     rustfmt: PathBuf,
     dir: Option<TempDir>,
+    reference_obj: bool,
 }
 
 impl Default for SkeletonBuilder {
@@ -120,6 +122,7 @@ impl SkeletonBuilder {
             clang_args: Vec::new(),
             rustfmt: "rustfmt".into(),
             dir: None,
+            reference_obj: false,
         }
     }
 
@@ -183,6 +186,27 @@ impl SkeletonBuilder {
         self
     }
 
+    /// Reference the object file via `include_bytes!` instead of inlining
+    /// the raw bytes in the generated skeleton.
+    ///
+    /// When enabled, the generated skeleton uses `include_bytes!` to
+    /// reference the compiled BPF object file by path. This dramatically
+    /// reduces memory usage and build times for large object files, but
+    /// means the skeleton is no longer self-contained — the object file
+    /// must be present at its original path when rustc compiles the
+    /// skeleton.
+    ///
+    /// When no explicit [`obj`](Self::obj) path is set, the object file
+    /// is placed in `OUT_DIR` so that it persists for rustc. If `OUT_DIR`
+    /// is not set (e.g. outside a build script), an explicit `obj` path
+    /// must be provided.
+    ///
+    /// Default is `false` (inline bytes, self-contained skeleton).
+    pub fn reference_obj(&mut self, reference: bool) -> &mut Self {
+        self.reference_obj = reference;
+        self
+    }
+
     /// Build BPF programs and generate the skeleton at path `output`
     ///
     /// # Notes
@@ -227,11 +251,31 @@ impl SkeletonBuilder {
 
         if self.obj.is_none() {
             let name = filename.split('.').next().unwrap();
-            let dir = tempdir().context("failed to create temporary directory")?;
-            let objfile = dir.path().join(format!("{name}.o"));
-            self.obj = Some(objfile);
-            // Hold onto tempdir so that it doesn't get deleted early
-            self.dir = Some(dir);
+            if self.reference_obj {
+                // Place in OUT_DIR so the .o file persists after the build
+                // script exits and is available when rustc processes
+                // include_bytes! in the generated skeleton.
+                let out_dir = env::var("OUT_DIR")
+                    .context("reference_obj requires OUT_DIR or an explicit obj path")?;
+                // Hash the source path to avoid collisions when
+                // multiple sources share the same name prefix.
+                let hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::Hash;
+                    use std::hash::Hasher;
+                    let mut h = DefaultHasher::new();
+                    source.hash(&mut h);
+                    h.finish()
+                };
+                let objfile = PathBuf::from(out_dir).join(format!("{name}_{hash:016x}.o"));
+                self.obj = Some(objfile);
+            } else {
+                let dir = tempdir().context("failed to create temporary directory")?;
+                let objfile = dir.path().join(format!("{name}.o"));
+                self.obj = Some(objfile);
+                // Hold onto tempdir so that it doesn't get deleted early
+                self.dir = Some(dir);
+            }
         }
 
         let mut builder = BpfObjBuilder::default();
@@ -256,6 +300,7 @@ impl SkeletonBuilder {
             objfile,
             r#gen::OutputDest::File(output.as_ref()),
             Some(&self.rustfmt),
+            self.reference_obj,
         )
         .with_context(|| format!("failed to generate `{}`", objfile.display()))?;
 
